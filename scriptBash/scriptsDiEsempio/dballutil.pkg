@@ -1,0 +1,2088 @@
+create or replace PACKAGE BODY           dballutil Is
+
+-- Variabili Globali utilizzate per passare info tra procedure
+   vLogEsito   NUMBER := 0;
+   vLogInfo    NUMBER := 1;
+   vLogWarn    NUMBER := 2;
+   vLogErr     NUMBER := 3;
+
+-- Dichiarazione Variabile per l'Eccezioni
+   my_code       NUMBER;
+   my_errm       VARCHAR2(32000);
+
+-- Di uso generale
+   vRecUpd       number;
+   vRecIns       number;
+   vRecDel       number;
+   vRecSki       number;
+   vCounter      number;
+   cCommitPoint  number := 5000;
+   vRetention    number;
+   cRetention    number := 100;
+   vSql          varchar2(500);
+   vText         varchar2(100);
+   vStart        date;
+   vEnd          date;
+   vElapsed      number;
+   vElapsedH     number;
+   vElapsedM     number;
+   vElapsedS     number;
+
+-- Variabili per la gestione del file di Log
+   id_file utl_file.file_type;
+--   vDir  varchar2(256) := '/DBAL1/UTL_FILE_DIR/logs';
+    vDir  varchar2(256) := 'NAUTILUS_LOG';
+--   vFile varchar2(256) := 'dballutil'||to_char(sysdate,'ddmmyyhh24miss')||'.log';
+   vFile varchar2(256) := 'dballutil';
+   vBuff varchar2(2000) ;
+   vFunc varchar2(30) ;
+   vUser varchar2(30) ;
+
+-- Dichiarazioni Variabili per le query
+   vDataRet       number;
+   vDataRetD      date;
+   vNextID        number;
+   vMinDiag       number;
+   vMaxSiz  number := 10000000;
+
+--  vTabPart varchar2(30) := 'REPORTER_STATUS';
+
+-- Dichiarazione di eccezioni personalizzate
+
+   part_notexist EXCEPTION;
+   PRAGMA EXCEPTION_INIT(part_notexist, -02149);
+   part_notsplit EXCEPTION;
+   PRAGMA EXCEPTION_INIT(part_notsplit, -14080);
+   record_exist EXCEPTION;
+   PRAGMA EXCEPTION_INIT(record_exist, -00001);
+   user_canc EXCEPTION;
+   PRAGMA EXCEPTION_INIT(user_canc, -01013);
+
+
+-- --------------------------------------------------------------------------------------------------
+-- FUNZIONE DI SERVIZIO PER IL TRACCIAMENTO SU FILE
+-- --------------------------------------------------------------------------------------------------
+PROCEDURE filTrace(idFile utl_file.file_type, cNomeProc VARCHAR2, cLogLevel NUMBER, cStringa VARCHAR2)
+AS
+vData   varchar(20);
+vLogStr varchar(5);
+vBuff   varchar2(2000);
+
+begin
+
+   CASE cLogLevel
+          WHEN 0 THEN vLogStr := 'ESITO';
+          WHEN 1 THEN vLogStr := 'INFO';
+          WHEN 2 THEN vLogStr := 'WARN';
+          WHEN 3 THEN vLogStr := 'ERR';
+          ELSE vLogStr := '-----';
+   END CASE;
+
+   vBuff := ('['||to_char(sysdate,'dd/mm/yyyy hh24:mi:ss')||'] ['||cNomeProc||'] ['||vLogStr||'] ['||cStringa||']');
+   utl_file.put_line(idFile,vBuff,True);
+
+end filTrace;
+
+-- --------------------------------------------------------------------------------------------------
+-- PROCEDURA PER LA CREAZIONE DELLA PARTIZIONE DI TABELLA
+-- --------------------------------------------------------------------------------------------------
+PROCEDURE MaintenanceTab (vRet number, vTabPart varchar2)
+AS
+
+QcreaPart VARCHAR2(1100) ;
+QdelPart VARCHAR2(1100) ;
+
+vDataIns VARCHAR2(10);
+vDataDel VARCHAR2(10);
+vPartIns VARCHAR2(30);
+vPartDel VARCHAR2(30);
+vPartToSplit VARCHAR2(30);
+vPartInMerge VARCHAR2(30);
+vPartOutMerge VARCHAR2(30);
+vPartMin VARCHAR2(30);
+
+vRetention number;
+vPartPos   number := 2;
+
+TYPE AlaCurTyp  IS REF CURSOR;
+v_ala_cursor    AlaCurTyp;
+Ala_record      alarm%ROWTYPE;
+vStrCursor      VARCHAR2(200);
+
+vRecordCount    NUMBER;
+vFreeSpace      NUMBER;
+vTotalSpace     NUMBER;
+vFreePCT        NUMBER;
+
+QdelJ VARCHAR2(500) := 'DELETE from ALARM_JOURNAL where ALARMID=:1';
+
+BEGIN
+
+vFunc := 'MaintenanceTab';
+id_file := opentrace(vDir, vFile);
+
+vStart := sysdate ;
+dballutil.filTrace(id_file,vFunc,vLogInfo,'INIZIO maintenance su tabella '||vTabPart);
+
+-- Imposta la Retention
+if (vRet < 15) then
+    vRetention := 15;
+else
+    vRetention := vRet;
+end if;
+
+vDataIns := to_char((sysdate+2),'YYYYMMDD');
+vDataDel := to_char((sysdate-vRetention),'YYYYMMDD');
+
+vPartIns := 'P_'||vDataIns;
+vPartDel := 'P_'||vDataDel;
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Partizione da cancellare: '||vPartDel);
+
+select count(*) into vRecordCount from ALARM;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Record in tabella '||vTabPart||': '||vRecordCount);
+
+select count(*) into vRecordCount from ALARM_JOURNAL;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Record in tabella ALARM_JOURNAL: '||vRecordCount);
+
+select sum(bytes) into vFreeSpace from dba_free_space_local where tablespace_name='REPOALARM_DATA' group by tablespace_name;
+select sum(bytes) into vTotalSpace from dba_data_files_local where tablespace_name='REPOALARM_DATA' group by tablespace_name;
+
+vFreePCT := round(vFreeSpace/vTotalSpace*100,2);
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Spazio libero in tablespace REPOALARM_DATA: '||vFreePCT);
+
+-- IDENTIFICA LA PARTIZIONE MAXVALUE DA RINOMINARE
+
+select PARTITION_NAME into vPartToSplit from user_tab_partitions where table_name = vTabPart and PARTITION_NAME like '%MAXVALUE%';
+if vPartToSplit = 'P_MAXVALUE' then
+   QcreaPart := 'ALTER TABLE '||vTabPart||' SPLIT PARTITION P_MAXVALUE at (to_date('||vDataIns||',''YYYYMMDD'')) INTO (partition '||vPartIns||', partition P_MAXVALUE_NEW) UPDATE INDEXES';
+else
+   QcreaPart := 'ALTER TABLE '||vTabPart||' SPLIT PARTITION P_MAXVALUE_NEW at (to_date('||vDataIns||',''YYYYMMDD'')) INTO (partition '||vPartIns||', partition P_MAXVALUE) UPDATE INDEXES';
+end if;
+
+   BEGIN
+     dballutil.filTrace(id_file,vFunc,vLogInfo,QcreaPart);
+         EXECUTE IMMEDIATE QcreaPart ;
+   EXCEPTION
+         WHEN part_notsplit THEN
+         dballutil.filTrace(id_file,vFunc,vLogInfo,'Partizione nuova da creare esistente - continuo');
+   END;
+
+
+-- INIZIO CICLONE PER LA CANCELLAZIONE DEI RECORDS DELLA ALARM_JOURNAL E DELLA PARTIZIONE DELLA ALARM
+
+   BEGIN
+    -- Imposto il nome della partizione minima
+    vPartMin := vPartDel;
+    dballutil.filTrace(id_file,vFunc,vLogInfo,'PartMin: '||vPartMin);
+
+    WHILE vPartPos >= 1 LOOP
+
+    select PARTITION_POSITION into vPartPos from user_tab_partitions where table_name = vTabPart and partition_name = vPartMin;
+    dballutil.filTrace(id_file,vFunc,vLogInfo,'PartPos: '||vPartPos);
+
+    -- Identifica la partizione di cui effettuare la DROP e cancella a loop finche' non arriva a quella che deve mantenere
+    select PARTITION_NAME into vPartInMerge  from user_tab_partitions where table_name = vTabPart and PARTITION_POSITION = 1 ;
+    dballutil.filTrace(id_file,vFunc,vLogInfo,'Drop partizione: '||vPartInMerge);
+
+
+   -- EFFETTUA LA CANCELLAZIONE DEI RECORDS DALLA TABELLA ALARM_JOURNAL
+   vRecDel  := 0;
+   vCounter := 0;
+   cCommitPoint := 10000;
+
+   dballutil.filTrace(id_file,vFunc,vLogInfo,'Inizio cancellazione records '||vTabPart||'_JOURNAL basata sulla partizione '||vPartInMerge||' della tabella '||vTabPart);
+
+   vStrCursor := 'SELECT ALARMID from ALARM partition ('||vPartInMerge||')';
+   dballutil.filTrace(id_file,vFunc,vLogInfo,'Apro il cursore: '||vStrCursor);
+   OPEN v_ala_cursor FOR vStrCursor;
+
+   LOOP
+    FETCH v_ala_cursor INTO Ala_record.ALARMID;
+    EXIT WHEN v_ala_cursor%NOTFOUND;
+
+    EXECUTE IMMEDIATE QdelJ using Ala_record.ALARMID;
+
+         vCounter := vCounter + 1;
+         vRecDel := vRecDel + 1;
+
+         if vCounter = cCommitPoint then
+            dballutil.filTrace(id_file,vFunc,vLogInfo,'Record elaborati da tabella '||vTabPart||' - '||vRecDel);
+            COMMIT;
+            vCounter := 0;
+         end if;
+   END LOOP;
+   COMMIT;
+
+   dballutil.filTrace(id_file,vFunc,vLogInfo,'Fine cancellazione records '||vTabPart||'_JOURNAL della partizione '||vPartInMerge||' della tabella '||vTabPart||'. Cancellati '||vRecDel||' records.');
+
+   -- EFFETTUA LA DROP DELLA PARTIZIONE DELLA TABELLA ALARM
+
+    dballutil.filTrace(id_file,vFunc,vLogInfo,'Eseguo drop partizione '||vPartInMerge);
+    QdelPart  := 'ALTER TABLE '||vTabPart||' DROP PARTITION '||vPartInMerge||' UPDATE INDEXES';
+    dballutil.filTrace(id_file,vFunc,vLogInfo,QdelPart);
+    EXECUTE IMMEDIATE QdelPart ;
+
+   END LOOP;
+-- FINE CICLONE PER LA CANCELLAZIONE DEI RECORDS DELLA ALARM_JOURNAL E DELLA PARTIZIONE DELLA ALARM
+
+   EXCEPTION
+         WHEN part_notexist THEN
+         dballutil.filTrace(id_file,vFunc,vLogInfo,'Partizione da cancellare non esistente - continuo');
+
+         WHEN no_data_found THEN
+     dballutil.filTrace(id_file,vFunc,vLogInfo,'Partizione da cancellare non esistente - continuo');
+
+         WHEN OTHERS THEN
+         my_code := SQLCODE;
+         my_errm := SQLERRM;
+         dballutil.filTrace(id_file,vFunc,vLogErr,'Error code ' || my_code || ': ' || my_errm);
+         return;
+
+   END;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Eseguo shrink tabella '||vTabPart);
+
+--QdelPart  := 'ALTER TABLE '||vTabPart||' ENABLE ROW MOVEMENT';
+--dballutil.filTrace(id_file,vFunc,vLogInfo,QdelPart);
+--EXECUTE IMMEDIATE QdelPart ;
+
+QdelPart  := 'ALTER TABLE '||vTabPart||' SHRINK SPACE';
+dballutil.filTrace(id_file,vFunc,vLogInfo,QdelPart);
+EXECUTE IMMEDIATE QdelPart ;
+
+select count(*) into vRecordCount from ALARM;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Record in tabella '||vTabPart||': '||vRecordCount);
+
+select count(*) into vRecordCount from ALARM_JOURNAL;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Record in tabella ALARM_JOURNAL: '||vRecordCount);
+
+select sum(bytes) into vFreeSpace from dba_free_space_local where tablespace_name='REPOALARM_DATA' group by tablespace_name;
+select sum(bytes) into vTotalSpace from dba_data_files_local where tablespace_name='REPOALARM_DATA' group by tablespace_name;
+
+vFreePCT := round(vFreeSpace/vTotalSpace*100,2);
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Spazio libero in tablespace REPOALARM_DATA: '||vFreePCT);
+
+vEnd := sysdate;
+
+--vElapsed := date_to_num(to_char(vEnd,'yyyymmddhh24miss'))-date_to_num(to_char(vStart,'yyyymmddhh24miss'));
+--vElapsedH := round((vElapsed/3600));
+--vElapsedM := round((vElapsed/60)-(vElapsedH*60));
+--vElapsedS := vElapsed-(vElapsedH*60*60)-(vElapsedM*60);
+--dballutil.filTrace(id_file,vFunc,vLogInfo,'Elapsed: '||vElapsed||' sec - '||vElapsedH||'.'||vElapsedM||'.'||vElapsedS);
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Elapsed: '||vElapsed||' sec - hh.mm.ss: '||dballutil.write_elapsed(vStart, vEnd));
+dballutil.filTrace(id_file,vFunc,vLogInfo,'FINE   maintenance su tabella '||vTabPart||' '||vStart||' - '||vEnd);
+utl_file.fclose(id_file);
+
+EXCEPTION
+   WHEN OTHERS THEN
+
+   my_code := SQLCODE;
+   my_errm := SQLERRM;
+
+   dballutil.filTrace(id_file,vFunc,vLogErr,'Error code ' || my_code || ': ' || my_errm);
+   return;
+
+END MaintenanceTab;
+
+
+-- --------------------------------------------------------------------------------------------------
+-- PROCEDURA PER il REBUILD degli indici UNUSABLE
+-- --------------------------------------------------------------------------------------------------
+PROCEDURE RebuildIndex
+AS
+
+QanaIndex VARCHAR2(1000) ;
+
+CURSOR rec_index is
+  --SELECT INDEX_NAME from user_indexes where STATUS='UNUSABLE';
+  SELECT INDEX_NAME from user_indexes;
+  rec_val  rec_index%ROWTYPE;
+
+BEGIN
+
+vFunc := 'RebuildIndex';
+id_file := opentrace(vDir, vFile);
+
+vStart := sysdate ;
+dballutil.filTrace(id_file,vFunc,vLogInfo,'INIZIO rebuild indexes');
+
+FOR  rec_val in rec_index
+   LOOP
+      exit when rec_index%NOTFOUND;
+
+         dballutil.filTrace(id_file,vFunc,vLogInfo,'Rebuild indice '||rec_val.index_name);
+         QanaIndex := 'ALTER INDEX '||rec_val.index_name||' REBUILD PCTFREE 0';
+         --dballutil.filTrace(id_file,vFunc,vLogInfo,QanaIndex);
+         EXECUTE IMMEDIATE QanaIndex ;
+   END LOOP;
+
+vEnd := sysdate;
+--vElapsed := round((vEnd - vStart),2)*86400;
+--vElapsedH := round((vElapsed/60/60));
+--vElapsedM := round((vElapsed/60)-(vElapsedH*60));
+--vElapsedS := vElapsed-(vElapsedH*60*60)-(vElapsedM*60);
+--dballutil.filTrace(id_file,vFunc,vLogInfo,'Elapsed: '||vElapsedH||'.'||vElapsedM||'.'||vElapsed);
+--dballutil.filTrace(id_file,vFunc,vLogInfo,'Elapsed sec: '||vElapsed||'( '||vStart||' - '||vEnd);
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Elapsed: '||vElapsed||' sec - hh.mm.ss: '||dballutil.write_elapsed(vStart, vEnd));
+--dballutil.filTrace(id_file,vFunc,vLogInfo,'Records cancellati: '||vRecDel);
+dballutil.filTrace(id_file,vFunc,vLogInfo,'FINE   rebuild indexes');
+utl_file.fclose(id_file);
+
+EXCEPTION
+   WHEN OTHERS THEN
+
+   my_code := SQLCODE;
+   my_errm := SQLERRM;
+
+   dballutil.filTrace(id_file,vFunc,vLogErr,'Error code ' || my_code || ': ' || my_errm);
+   return;
+
+END RebuildIndex;
+
+
+
+-- --------------------------------------------------------------------------------------------------
+-- PROCEDURA PER L'ANALYZE DELLE PARTIZIONI
+-- --------------------------------------------------------------------------------------------------
+PROCEDURE AnalyzeTables (vAnaTab varchar2, vDay number)
+AS
+
+QanaIndex VARCHAR2(1000) ;
+
+CURSOR rec_index is
+  SELECT TABLE_NAME,PARTITION_NAME from user_tab_partitions where TABLE_NAME = vAnaTab
+  and (PARTITION_POSITION >= (select max(PARTITION_POSITION)-vDay from user_tab_partitions where TABLE_NAME = vAnaTab)
+  or PARTITION_POSITION = 1 or LAST_ANALYZED is null);
+  rec_val  rec_index%ROWTYPE;
+--  SELECT TABLE_NAME, PARTITION_NAME from user_tab_partitions where TABLE_NAME = vAnaTab;
+
+BEGIN
+
+vFunc := 'AnalyzeTables';
+id_file := opentrace(vDir, vFile);
+
+vStart := sysdate ;
+dballutil.filTrace(id_file,vFunc,vLogInfo,'INIZIO ANALYZE TABELLE');
+
+FOR  rec_val in rec_index
+   LOOP
+      exit when rec_index%NOTFOUND;
+
+--         dballutil.filTrace(id_file,vFunc,vLogInfo,'INIZIO ANALYZE tabella '||rec_val.table_name||' partizione '||rec_val.partition_name);
+--         QanaIndex := 'ANALYZE TABLE '||rec_val.TABLE_NAME||' PARTITION ('||rec_val.PARTITION_NAME||') COMPUTE STATISTICS';
+--         dballutil.filTrace(id_file,vFunc,vLogInfo,QanaIndex);
+--         EXECUTE IMMEDIATE QanaIndex ;
+--         DBMS_STATS.GATHER_TABLE_STATS(OWNER=>vUser, TABNAME=>rec_val.table_name, PARTNAME=>rec_val.partition_name);
+--         DBMS_STATS.GATHER_TABLE_STATS(vUser, rec_val.table_name, rec_val.partition_name);
+         dballutil.filTrace(id_file,vFunc,vLogInfo,'INIZIO ANALYZE tabella '||rec_val.table_name||' partizione '||rec_val.partition_name);
+--         dballutil.filTrace(id_file,vFunc,vLogInfo,'INIZIO ANALYZE tabella '||vAnaTab);
+         DBMS_STATS.GATHER_TABLE_STATS(vUser, rec_val.table_name, rec_val.partition_name, null);
+--         DBMS_STATS.GATHER_TABLE_STATS(vUser, vAnaTab, null, null);
+--         dballutil.filTrace(id_file,vFunc,vLogInfo,'FINE   ANALYZE tabella '||vAnaTab);
+         dballutil.filTrace(id_file,vFunc,vLogInfo,'FINE   ANALYZE tabella '||rec_val.table_name||' partizione '||rec_val.partition_name);
+
+
+   END LOOP;
+
+vEnd := sysdate;
+
+--vElapsed := date_to_num(to_char(vEnd,'yyyymmddhh24miss'))-date_to_num(to_char(vStart,'yyyymmddhh24miss'));
+--vElapsedH := round((vElapsed/3600));
+--vElapsedM := round((vElapsed/60)-(vElapsedH*60));
+--vElapsedS := vElapsed-(vElapsedH*60*60)-(vElapsedM*60);
+--dballutil.filTrace(id_file,vFunc,vLogInfo,'Elapsed: '||vElapsed||' sec - '||vElapsedH||'.'||vElapsedM||'.'||vElapsedS);
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Elapsed: '||vElapsed||' sec - hh.mm.ss: '||dballutil.write_elapsed(vStart, vEnd));
+dballutil.filTrace(id_file,vFunc,vLogInfo,'FINE   ANALYZE su tabella '||vAnaTab||' '||vStart||' - '||vEnd);
+utl_file.fclose(id_file);
+
+EXCEPTION
+   WHEN OTHERS THEN
+
+   my_code := SQLCODE;
+   my_errm := SQLERRM;
+
+   dballutil.filTrace(id_file,vFunc,vLogErr,'Error code ' || my_code || ': ' || my_errm);
+   return;
+
+END AnalyzeTables;
+
+-- --------------------------------------------------------------------------------------------------
+-- FUNZIONI PER LA CONVERSIONE DELLA DATA
+-- --------------------------------------------------------------------------------------------------
+FUNCTION num_to_date (remedy_date IN NUMBER) RETURN DATE IS
+        v_first_daylight_saving         DATE ;
+        v_last_daylight_saving          DATE ;
+        v_oracle_date                   DATE ;
+BEGIN
+   IF remedy_date IS NULL
+   THEN
+      v_oracle_date := NULL;
+   ELSE
+-- calcolo la data in formato oracle
+      v_oracle_date := TO_DATE('01/01/1970 01:00:00','DD/MM/YYYY HH24:MI:SS')+(remedy_date/86400) ;
+-- seleziono la domenica precedente al primo di aprile dell'anno considerato
+      v_first_daylight_saving := NEXT_DAY(TO_DATE('31-mar-'||TO_CHAR(v_oracle_date,'yyyy')||' 02:00:00','dd-mon-yyyy hh24:mi:ss'), TO_CHAR(TO_DATE('2000-01-30','yyyy-mm-dd'),'day')) - 7;
+
+-- seleziono la domenica precedente al primo di novembre dell'anno considerato
+      v_last_daylight_saving := NEXT_DAY(TO_DATE('01-nov-'||TO_CHAR(v_oracle_date,'yyyy')||' 02:00:00','dd-mon-yyyy hh24:mi:ss'),TO_CHAR(TO_DATE('2000-01-30','yyyy-mm-dd'),'day')) - 7;
+
+      IF ( v_oracle_date >= v_first_daylight_saving AND v_oracle_date <= v_last_daylight_saving )
+      THEN
+         v_oracle_date := v_oracle_date + (1/24) ;    --- aggiungo l'ora legale
+      END IF ;
+   END IF;
+
+RETURN  v_oracle_date ;
+
+END num_to_date ;
+
+
+FUNCTION date_to_num (oracle_date IN VARCHAR2) RETURN NUMBER IS
+
+v_seconds_elapsed               NUMBER;
+v_first_daylight_saving         DATE ;
+v_last_daylight_saving          DATE ;
+v_oracle_date                   DATE ;
+
+BEGIN
+
+   v_oracle_date := TO_DATE(oracle_date,'yyyymmddhh24miss');
+
+   v_first_daylight_saving := NEXT_DAY(TO_DATE('31-mar-'||TO_CHAR(v_oracle_date,'yyyy')||' 02:00:00','dd-mon-yyyy hh24:mi:ss'),TO_CHAR(TO_DATE('2000-01-30','yyyy-mm-dd'),'day')) - 7;
+
+-- seleziono la domenica precedente al primo di novembre dell'anno considerato
+   v_last_daylight_saving := NEXT_DAY(TO_DATE('01-nov-'||TO_CHAR(v_oracle_date,'yyyy')||' 02:00:00','dd-mon-yyyy hh24:mi:ss'),TO_CHAR(TO_DATE('2000-01-30','yyyy-mm-dd'),'day')) - 7;
+
+-- verifica su incidenza ora legale
+   IF ( v_oracle_date >= v_first_daylight_saving AND v_oracle_date <= v_last_daylight_saving ) THEN
+      v_oracle_date := v_oracle_date - (1/24) ;
+   END IF ;
+
+-- sottraggo  3600 secondi per considerare la mia timezone (Berlin+Rome)
+   v_seconds_elapsed := ((v_oracle_date - TO_DATE('01/01/1970 00:00:00','DD/MM/YYYY HH24:MI:SS'))*86400) - 3600;
+
+RETURN  ROUND(v_seconds_elapsed) ;
+
+END date_to_num ;
+
+-- --------------------------------------------------------------------------------------------------
+-- FUNZIONE PER L'APERTURA DEL FILE DI TRACCIAMENTO SULLA BASE DELL'UTENTE
+-- --------------------------------------------------------------------------------------------------
+FUNCTION opentrace (vDir varchar2, vFile varchar2)
+   return utl_file.file_type
+   is
+   out_data utl_file.file_type;
+
+   vFileNew varchar2(256);
+   vFileOld varchar2(256);
+
+   v_exists    BOOLEAN;
+   v_length    NUMBER;
+   v_blocksize NUMBER;
+
+BEGIN
+  select USERNAME into vUser from USER_USERS;
+  vFileNew := vFile||'_'||vUser||'.log';
+
+  utl_file.fgetattr(vDir,vFileNew,v_exists, v_length, v_blocksize);
+  IF v_exists THEN
+        IF v_length > vMaxSiz then
+              vFileOld := vFileNew||'_OLD';
+              utl_file.frename (vDir, vFileNew, vDir, vFileOld, TRUE);
+        END IF;
+  END IF;
+  out_data := utl_file.fopen(vDir,vFileNew,'a');
+  return(out_data);
+
+END opentrace;
+
+-- --------------------------------------------------------------------------------------------------
+-- FUNZIONE PER IL TRACCIAMENTO DEI TEMPI
+-- --------------------------------------------------------------------------------------------------
+FUNCTION write_elapsed (vStart IN Date, vEnd IN Date) return varchar2 IS
+
+   vHMS varchar2(10);
+
+BEGIN
+   vElapsed := date_to_num(to_char(vEnd,'yyyymmddhh24miss'))-date_to_num(to_char(vStart,'yyyymmddhh24miss'));
+   vElapsedH := round((vElapsed/3600));
+   vElapsedM := round((vElapsed-(vElapsedH*60))/60);
+   vElapsedS := vElapsed-(vElapsedH*3600)-(vElapsedM*60);
+   return (vElapsedH||'.'||vElapsedM||'.'||vElapsedS);
+
+END write_elapsed;
+
+-- --------------------------------------------------------------------------------------------------
+-- PROCEDURA PER LA PRODUZIONE DEL FILE DEGLI ALLARMI DA TRASFERIRE SU WAV2
+-- --------------------------------------------------------------------------------------------------
+-- ALLARMI STORICI
+PROCEDURE creaWAV2 (vData date)
+AS
+
+vDataMin  VARCHAR2(17);
+vDataMinD Date;
+vDataMax  VARCHAR2(17);
+vDataMaxD Date;
+vDataExp  VARCHAR2(8);
+vOutFile  UTL_FILE.FILE_TYPE;
+vOutFileJ UTL_FILE.FILE_TYPE;
+vOutFileR UTL_FILE.FILE_TYPE;
+
+v_rows_processed integer := 0;
+
+vInsertDate Date := sysdate ;
+
+CURSOR rec_name IS
+    SELECT
+        ID,
+        SOURCE,
+        ALARMID,
+        ORIGINALALARMID,
+        SEVERITY,
+        ORIGINALSEVERITY,
+        PROBABLECAUSE,
+        SUMMARY,
+        ALARMCOUNT,
+        ALARMTYPE,
+        ALARMGROUP,
+        CATEGORY,
+        CLASS,
+        AGENT,
+        MANAGER,
+        EM,
+        IPEM,
+        FIRSTOCCURRENCE,
+        LASTOCCURRENCE,
+        NESTARTALARM,
+        NELASTALARM,
+        ACKNOWLEDGED,
+        ACKTIME,
+        CLOSETIME,
+        COMPETENCEOB,
+        COMPETENCEFOB,
+        MGMTCENTER,
+        LOCDESCR,
+        LOCNAME,
+        LOCID,
+        LOCGROUP,
+        NETWORK,
+        SUBNETWORK,
+        ORIGINALNEID,
+        NEID,
+        NEADDRESS,
+        NETYPE,
+        ORIGINALNETYPE,
+        MANUFACTURER,
+        ORIGINALRESOURCENAME,
+        RESOURCENAME,
+        RESOURCETYPE,
+        ORIGINALRESOURCETYPE,
+        CARDNAME,
+        CARDTYPEID,
+        CARDTYPEDESCR,
+        ORIGINALCARDNAME,
+        PORTNAME,
+        ORIGINALPORTNAME,
+        PORTTYPE,
+        RESOURCESTATUS,
+        LINKNAME,
+        LINKID,
+        LINKTYPE,
+        LINKSTATUS,
+        LOCDESCRA,
+        LOCNAMEA,
+        LOCIDA,
+        LOCGROUPA,
+        LOCDESCRZ,
+        LOCNAMEZ,
+        LOCIDZ,
+        LOCGROUPZ,
+        LINKACTIVATIONTIME,
+        SERVICEID,
+        CLIENTNAME,
+        SERVICENAME,
+        PARENTIDS,
+        ISCORRELATED,
+        TTIDENTIFIER,
+        TTPARENTID,
+        TTREQUESTSTATUS,
+        TTREQUESTTIME,
+        TTOWNERID,
+        TX_STATOMTAMASS,
+        TX_TIPODEVICEMASS,
+        TX_TIPOCOSTITUZIONE,
+        TX_PAYLOADTYPE,
+        TX_FLAGDIVERSIFICAZIONE,
+        TX_FLAGPROTEZIONE,
+        TX_NUMGRUPPIINSTRADATI,
+        TX_STRATORETE,
+        TX_STATOAFFIDABILITA,
+        TX_TIPOTERMINAZ,
+        TX_TIPOUTILGRUPPO,
+        TX_CODICEANELLO,
+        TX_DESCRCATEGORIA,
+        TX_PRESENZALOP,
+        TX_ISALARMORIGINE,
+        TX_ISTOPOCORRELATED,
+        TX_PROGRGRUPPO,
+        TX_NODEPROGR,
+        TX_RETECLIENTEGRUPPO,
+        BB_MULTICAST,
+        BB_VPNNUM,
+        BB_VRFNAME,
+        BB_SUPPORTEDPVCS,
+        BB_TIPOMSG,
+        BB_GRUPPO,
+        BB_MGMTSTATUS,
+        BBTX_COMPETENZA,
+        BBTX_COMPETENZAINTERNA,
+        BBTX_STATOTX,
+        BBTX_STATOBB,
+        BBTX_ARCORRELATI,
+        CX_CONOSCENZA,
+        PARK,
+        OUTAGE,
+        BB,
+        TX,
+        CX,
+        NMS,
+        CORRELATIONTRIGGER,
+        TXCX_DELTA,
+        NMS_SPECIFICPROBLEMS,
+        NMS_STATE,
+        NMS_NWSYNONYM,
+        TO_ROS,
+        TX_SUBNOC,
+        TX_NOMELP,
+        TX_CUSTOME,
+        TX_CUSTOM1,
+        TX_CUSTOM2,
+        TX_CUSTOM3,
+        TX_CUSTOM9,
+        TX_CUSTOMA,
+        TX_CUSTOMB,
+        TX_CLASSE_TP,
+        TX_RUOLO_TP,
+        TX_TELAIOEM,
+        TX_TELAIONM,
+        TX_MODULOEM,
+        TX_MODULONM,
+        TX_COMPLESSOEM,
+        TX_COMPLESSONM,
+        TX_PERSISTENCETIMEOB,
+        TX_PERSISTENCETIMEFOB,
+        TX_FREQUENCYTIME,
+        TX_FREQUENCYCOUNT,
+        TX_DATACOS_ROS,
+        TX_DATACOS,
+        TX_DATAROS,
+        NMS_ADDITIONALINFO,
+        NMS_MANAGEMENTSTATE,
+        NMS_AWARDEEROLE,
+        BB_VARINT1,
+        BB_VARINT2,
+        BB_VARINT3,
+        BB_VARINT4,
+        BB_VARINT5,
+        BB_VARINT6,
+        BB_VARINT7,
+        BB_VARINT8,
+        BB_VARSTRING1,
+        BB_VARSTRING2,
+        BB_VARSTRING3,
+        BB_VARSTRING4,
+        BB_VARSTRING5,
+        BB_VARSTRING6,
+        BB_VARSTRING7,
+        BB_VARSTRING8,
+        CX_ACRONIMOOPM,
+        CX_ADDITIONALINFO,
+        CX_ALARMQUALIFIERLIST,
+        CX_AUTONBATTERIE,
+        CX_DATETIMENTTCREATION,
+        CX_DEGRADO,
+        CX_DEGRTIME,
+        CX_EMALIAS,
+        CX_EMFILTERTYPE,
+        CX_FREQUENCY_MSEM,
+        CX_IDOPM,
+        CX_INTEXT,
+        CX_MAINTENANCESTATUSCURRENT,
+        CX_MESSAGE_TYPE,
+        CX_NELASTMOD,
+        CX_NTTID,
+        CX_NUMMSEM,
+        NE_FUORISERVIZIO,
+        CX_PORTELINK,
+        CX_PRGRUPPOEI,
+        CX_PROBABLECAUSE,
+        CX_STATO,
+        CX_TIPOSEGNMSEM,
+        CX_TOTALEPORTEDISSERVITE,
+        CX_NUMUTENTIDISS,
+        ACTION_STATUS,
+        ACTION_MESSAGE,
+        INTALARMID,
+        TX_SALA,
+        TX_FILA,
+        TX_TELAIOLIDO,
+        TX_MODULOLIDO,
+        TX_ALERTGROUP,
+        TX_COMPLESSOLIDO,
+        LAST_UPDATE,
+        ACKUSERID,
+        PARKEXPIRETIME,
+        CORRELATIONROLE,
+        NUMFIGLI,
+        CX_NOTE,
+        TXCX_RELATION,
+        ALARM_USERID_LOCK,
+        TX_CLIENTE_SPV,
+        CX_SPD,
+        CX_RELATEDALARM,
+        BB_RELATEDALARM,
+        NMS_MANAGEDBY,
+        TX_CUSTOM10,
+        NMS_ADDITIONALTEXT,
+        NMS_SPECIFICPROBLEM,
+        NMS_STATOATTESASETTIME,
+        NMS_STATOATTESA,
+        NUMERO_JOURNAL,
+        RECOVERY_STATUS,
+        RECOVERY_FLOW,
+        NMS_DEST,
+        NMS_ACKUSERID,
+        CX_DELETEACK,
+        CX_IDV5,
+        CX_L3ADDRESS,
+        NMS_CORR1,
+        RECOVERY_WF_ID,
+        NMS_ORIGINAL_FDN,
+        RECOVERY_TYPE,
+        RECOVERY_EXITCODE,
+        LAST_JOURNAL_MESSAGE,
+        NMS_SITESHARING,
+        INSERT_DATE,
+        FIRSTSEVERITY,
+        DELETEDAT,
+        HISTORIZE_STATE,
+        ALARMTYPEID,
+        TX_CAMPIHCW,
+        TX_CHIAVESM,
+        TX_CLIENTETOP2HCW,
+        CORRINTRA,
+        TX_FORWARD2CX,
+        TX_FORWARD2HCW,
+        TX_FORWARD2TISA,
+        TX_IDCORRINTRAPDH,
+        TX_IDINNESCO,
+        TX_IDPADRECORR,
+        TX_NUMEROFIGLI,
+        TX_STATOESERCIZIOSCHEDA,
+        TX_MASSEXTCORRELATO,
+        TX_ISABILITANTE,
+        ISROOTCAUSE,
+        ROOTCAUSEID,
+        IMPACTANALISYS,
+        CORRSTR1,
+        TOOPERATIONVIEW,
+        GAA_STATUS,
+        MOB_SLOGAN,
+        MOB_ID_DC,
+        MOB_SUPERCRITICAL,
+        MOB_SA_FDN,
+        ORIGINALPARENTIDS,
+        PRIORITY,
+        STRATEGICITA,
+        STD_PROBABLECAUSE,
+        CX_EOC,
+        DATASCOR_R2010_EXT,
+        CX_SUBINTERFACE,
+        CX_LINE,
+        CX_SLOT,
+        CX_PASSOTLI,
+        CX_DATETIMEOSBEGIN,
+        CX_DATETIMEOSEND,
+        STD_PROBABLECAUSE_NO,
+        TX_NETWORKALARM,
+        TIPOINDOTTO,
+        RESOURCENAMETOVIEW,
+        MOB_CAT_SITO,
+        MODELLO,
+        CX_ROUTINGTIME,
+        LASTSEVERITY,
+        MANUAL_CLOSE,
+        MOB_KEY_TYPE,
+        ORIGINE_GUASTO,
+        MOB_ACCESSIB_SITO,
+        FLAG_DISP_ON_FIELD,
+        WRIDENTIFIER,
+        WRSTATUS,
+        MOB_CELLNAME,
+        WRTYPE,
+        TTPRIORITY,
+        TTCORRELATIONSTATE,
+        TIPO_NTT,
+        FLAG_STD_PROBABLECAUSE,
+        STATO_IMPIANTO,
+        DATA_STATO,
+        ADMINISTRATIVE_STATE,
+        OPERATIONAL_STATE,
+        DATAPRESENTAZIONE,
+        FLAG_PS
+    FROM alarm WHERE
+    --DELETEDAT between vDataMinD and vDataMaxD
+    LASTOCCURRENCE between vDataMinD and vDataMaxD
+    ORDER by DELETEDAT asc;
+
+CURSOR aj_rec_name IS
+    SELECT
+        ALARM_IDENTIFIER,
+        MSGDATE,
+        MESSAGE,
+        USERID,
+        MSGTYPE,
+        INSERT_DATE,
+        HISTORIZE_STATE,
+        ALARMID,
+        SOURCE,
+        AZIONE
+    FROM alarm_journal WHERE ALARMID in
+    (SELECT ALARMID from ALARM WHERE LASTOCCURRENCE between vDataMinD and vDataMaxD);
+
+CURSOR arh_rec_name IS
+    SELECT
+        ALARM_IDENTIFIER,
+        SOURCE,
+        IDENTIFIER,
+        RECOVERY_DATE,
+        RECOVERY_EXITCODE,
+        RECOVERY_TYPE,
+        RECOVERY_WF_ID,
+        ALARMID
+    FROM alarm_recovery_history WHERE ALARMID in
+    (SELECT ALARMID from ALARM WHERE LASTOCCURRENCE between vDataMinD and vDataMaxD);
+
+    rec_val     rec_name%ROWTYPE;
+    aj_rec_val  aj_rec_name%ROWTYPE;
+    arh_rec_val arh_rec_name%ROWTYPE;
+
+BEGIN
+vFunc := 'creaWAV2';
+id_file := opentrace(vDir, vFile);
+
+vStart := sysdate ;
+
+if (vData is null) then
+        vDataMin  := to_char((sysdate-1),'YYYYMMDD')||' 00:00:00';
+        vDataMax  := to_char((sysdate-1),'YYYYMMDD')||' 23:59:59';
+        vDataExp  := to_char(sysdate, 'YYYYMMDD');
+    else
+        vDataMin  := to_char(vData,'YYYYMMDD')||' 00:00:00';
+        vDataMax  := to_char(vData,'YYYYMMDD')||' 23:59:59';
+        vDataExp  := to_char(vData,'YYYYMMDD');
+end if;
+
+vOutFile  := UTL_FILE.FOPEN('NAUTILUS_DATA', 'WAV2_ALARM_' || vDataExp || '.csv', 'W', 32767);
+vOutFileJ := UTL_FILE.FOPEN('NAUTILUS_DATA', 'WAV2_ALARM_JOURNAL_' || vDataExp || '.csv', 'W', 32767);
+vOutFileR := UTL_FILE.FOPEN('NAUTILUS_DATA', 'WAV2_ALARM_RECOVERY_' || vDataExp || '.csv', 'W', 32767);
+
+vDataMinD := to_date(vDataMin,'YYYYMMDD hh24:mi:ss');
+vDataMaxD := to_date(vDataMax,'YYYYMMDD hh24:mi:ss');
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'INIZIO creaWAV2 su ALARM ' || vDataMin || ' - ' || vDataMax);
+
+vRecIns  := 0;
+vCounter := 0;
+cCommitPoint := 10000;
+
+-- Inizio il loop sulla tabella ALARM
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Inizio estrazione dalla tabella ALARM');
+
+OPEN rec_name;
+LOOP
+    FETCH rec_name INTO rec_val;
+    EXIT WHEN rec_name%NOTFOUND;
+
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ID), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.SOURCE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ALARMID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALALARMID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.SEVERITY), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ORIGINALSEVERITY), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.PROBABLECAUSE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.SUMMARY, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ALARMCOUNT), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ALARMTYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ALARMGROUP, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CATEGORY), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CLASS), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.AGENT, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MANAGER, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.EM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.IPEM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.FIRSTOCCURRENCE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.LASTOCCURRENCE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NESTARTALARM, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NELASTALARM, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ACKNOWLEDGED), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ACKTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CLOSETIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.COMPETENCEOB, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.COMPETENCEFOB, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MGMTCENTER, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCDESCR, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCNAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCGROUP, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NETWORK, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.SUBNETWORK, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALNEID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NEID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NEADDRESS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NETYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALNETYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MANUFACTURER, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALRESOURCENAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.RESOURCENAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.RESOURCETYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALRESOURCETYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CARDNAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CARDTYPEID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CARDTYPEDESCR, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALCARDNAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.PORTNAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALPORTNAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.PORTTYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.RESOURCESTATUS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LINKNAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LINKID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LINKTYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LINKSTATUS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCDESCRA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCNAMEA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCIDA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCGROUPA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCDESCRZ, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCNAMEZ, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCIDZ, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LOCGROUPZ, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.LINKACTIVATIONTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.SERVICEID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CLIENTNAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.SERVICENAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.PARENTIDS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ISCORRELATED), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TTIDENTIFIER, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TTPARENTID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TTREQUESTSTATUS), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TTREQUESTTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TTOWNERID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_STATOMTAMASS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TIPODEVICEMASS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TIPOCOSTITUZIONE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_PAYLOADTYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_FLAGDIVERSIFICAZIONE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_FLAGPROTEZIONE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_NUMGRUPPIINSTRADATI), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_STRATORETE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_STATOAFFIDABILITA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TIPOTERMINAZ, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TIPOUTILGRUPPO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CODICEANELLO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_DESCRCATEGORIA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_PRESENZALOP), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_ISALARMORIGINE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_ISTOPOCORRELATED), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_PROGRGRUPPO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_NODEPROGR, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_RETECLIENTEGRUPPO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_MULTICAST), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VPNNUM), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VRFNAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_SUPPORTEDPVCS), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_TIPOMSG, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_GRUPPO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_MGMTSTATUS), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_COMPETENZA), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_COMPETENZAINTERNA), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_STATOTX), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_STATOBB), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_ARCORRELATI), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_CONOSCENZA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.PARK), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.OUTAGE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NMS), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CORRELATIONTRIGGER), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TXCX_DELTA), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_SPECIFICPROBLEMS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_STATE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_NWSYNONYM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TO_ROS), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_SUBNOC, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_NOMELP, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CUSTOME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM1), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM2), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM3), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM9), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CUSTOMA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CUSTOMB, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CLASSE_TP, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_RUOLO_TP, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TELAIOEM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TELAIONM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_MODULOEM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_MODULONM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_COMPLESSOEM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_COMPLESSONM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_PERSISTENCETIMEOB), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_PERSISTENCETIMEFOB), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FREQUENCYTIME), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FREQUENCYCOUNT), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_DATACOS_ROS, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_DATACOS, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_DATAROS, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_ADDITIONALINFO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_MANAGEMENTSTATE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_AWARDEEROLE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT1), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT2), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT3), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT4), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT5), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT6), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT7), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT8), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING1, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING2, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING3, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING4, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING5, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING6, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING7, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING8, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_ACRONIMOOPM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_ADDITIONALINFO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_ALARMQUALIFIERLIST, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_AUTONBATTERIE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DATETIMENTTCREATION, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_DEGRADO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DEGRTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_EMALIAS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_EMFILTERTYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_FREQUENCY_MSEM), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_IDOPM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_INTEXT, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_MAINTENANCESTATUSCURRENT, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_MESSAGE_TYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_NELASTMOD, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_NTTID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_NUMMSEM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NE_FUORISERVIZIO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_PORTELINK, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_PRGRUPPOEI, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_PROBABLECAUSE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_STATO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_TIPOSEGNMSEM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_TOTALEPORTEDISSERVITE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_NUMUTENTIDISS), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ACTION_STATUS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ACTION_MESSAGE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.INTALARMID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_SALA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_FILA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TELAIOLIDO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_MODULOLIDO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_ALERTGROUP, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_COMPLESSOLIDO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.LAST_UPDATE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ACKUSERID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.PARKEXPIRETIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CORRELATIONROLE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NUMFIGLI), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_NOTE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TXCX_RELATION, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ALARM_USERID_LOCK, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CLIENTE_SPV, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_SPD, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_RELATEDALARM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.BB_RELATEDALARM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_MANAGEDBY, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM10), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_ADDITIONALTEXT, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_SPECIFICPROBLEM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NMS_STATOATTESASETTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_STATOATTESA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NUMERO_JOURNAL), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.RECOVERY_STATUS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.RECOVERY_FLOW, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_DEST, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_ACKUSERID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DELETEACK), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_IDV5, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_L3ADDRESS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_CORR1, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.RECOVERY_WF_ID), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_ORIGINAL_FDN, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.RECOVERY_TYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.RECOVERY_EXITCODE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.LAST_JOURNAL_MESSAGE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_SITESHARING, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.INSERT_DATE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.FIRSTSEVERITY), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.DELETEDAT, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.HISTORIZE_STATE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ALARMTYPEID), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CAMPIHCW, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CHIAVESM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CLIENTETOP2HCW, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CORRINTRA), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FORWARD2CX), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FORWARD2HCW), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FORWARD2TISA), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_IDCORRINTRAPDH, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_IDINNESCO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_IDPADRECORR, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_NUMEROFIGLI), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_STATOESERCIZIOSCHEDA), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_MASSEXTCORRELATO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_ISABILITANTE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ISROOTCAUSE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ROOTCAUSEID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.IMPACTANALISYS), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CORRSTR1, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TOOPERATIONVIEW), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.GAA_STATUS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_SLOGAN, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_ID_DC, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_SUPERCRITICAL, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_SA_FDN, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALPARENTIDS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.PRIORITY, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.STRATEGICITA, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.STD_PROBABLECAUSE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_EOC, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.DATASCOR_R2010_EXT, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_SUBINTERFACE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_LINE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_SLOT, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.CX_PASSOTLI, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DATETIMEOSBEGIN, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DATETIMEOSEND, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.STD_PROBABLECAUSE_NO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TX_NETWORKALARM, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TIPOINDOTTO), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.RESOURCENAMETOVIEW, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_CAT_SITO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MODELLO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_ROUTINGTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.LASTSEVERITY), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.MANUAL_CLOSE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.MOB_KEY_TYPE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ORIGINE_GUASTO), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.MOB_ACCESSIB_SITO), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.FLAG_DISP_ON_FIELD), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.WRIDENTIFIER, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.WRSTATUS, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_CELLNAME, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.WRTYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.TTPRIORITY, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TTCORRELATIONSTATE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TIPO_NTT), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.FLAG_STD_PROBABLECAUSE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.STATO_IMPIANTO, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.DATA_STATO, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.ADMINISTRATIVE_STATE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.OPERATIONAL_STATE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.DATAPRESENTAZIONE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFile, replace(rec_val.FLAG_PS, chr(10), ''));
+    UTL_FILE.NEW_LINE(vOutFile);
+    UTL_FILE.FFLUSH(vOutFile);
+
+    vRecIns := vRecIns + 1;
+    vCounter := vCounter + 1;
+
+    IF vCounter = cCommitPoint then
+        dballutil.filTrace(id_file,vFunc,vLogInfo,'Estratti '|| vRecIns || ' records');
+        vCounter := 0;
+    END IF;
+END LOOP;
+
+CLOSE rec_name;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Estratti '|| vRecIns || ' records');
+
+vRecIns  := 0;
+vCounter := 0;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Inizio estrazione dalla tabella ALARM_JOURNAL');
+
+FOR aj_rec_val IN aj_rec_name
+LOOP
+    EXIT WHEN aj_rec_name%NOTFOUND;
+
+    UTL_FILE.PUT(vOutFileJ, replace(TO_CHAR(aj_rec_val.ALARM_IDENTIFIER), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileJ, replace(TO_CHAR(aj_rec_val.MSGDATE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileJ, replace(aj_rec_val.MESSAGE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileJ, replace(aj_rec_val.USERID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileJ, replace(aj_rec_val.MSGTYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileJ, replace(TO_CHAR(aj_rec_val.INSERT_DATE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileJ, replace(aj_rec_val.HISTORIZE_STATE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileJ, replace(aj_rec_val.ALARMID, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileJ, replace(aj_rec_val.SOURCE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileJ, replace(aj_rec_val.AZIONE, chr(10), ''));
+    UTL_FILE.NEW_LINE(vOutFileJ);
+    UTL_FILE.FFLUSH(vOutFileJ);
+
+    vRecIns := vRecIns + 1;
+    vCounter := vCounter + 1;
+
+    IF vCounter = cCommitPoint then
+        dballutil.filTrace(id_file,vFunc,vLogInfo,'Estratti '|| vRecIns || ' records');
+        vCounter := 0;
+    END IF;
+END LOOP;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Estratti '|| vRecIns || ' records');
+
+vRecIns  := 0;
+vCounter := 0;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Inizio estrazione dalla tabella ALARM_RECOVERY_HISTORY');
+
+FOR arh_rec_val IN arh_rec_name
+LOOP
+    EXIT WHEN arh_rec_name%NOTFOUND;
+
+    UTL_FILE.PUT(vOutFileR, replace(TO_CHAR(arh_rec_val.ALARM_IDENTIFIER), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileR, replace(arh_rec_val.SOURCE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileR, replace(arh_rec_val.IDENTIFIER, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileR, replace(TO_CHAR(arh_rec_val.RECOVERY_DATE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileR, replace(TO_CHAR(arh_rec_val.RECOVERY_EXITCODE), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileR, replace(arh_rec_val.RECOVERY_TYPE, chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileR, replace(TO_CHAR(arh_rec_val.RECOVERY_WF_ID), chr(10), '') || chr(31));
+    UTL_FILE.PUT(vOutFileR, replace(arh_rec_val.ALARMID, chr(10), ''));
+    UTL_FILE.NEW_LINE(vOutFileR);
+    UTL_FILE.FFLUSH(vOutFileR);
+
+    vRecIns := vRecIns + 1;
+    vCounter := vCounter + 1;
+
+    IF vCounter = cCommitPoint then
+        dballutil.filTrace(id_file,vFunc,vLogInfo,'Estratti '|| vRecIns || ' records');
+        vCounter := 0;
+    END IF;
+END LOOP;
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Estratti '|| vRecIns || ' records');
+dballutil.filTrace(id_file,vFunc,vLogInfo,'FINE   creaWAV2 su ALARM');
+
+UTL_FILE.FCLOSE(vOutFile);
+UTL_FILE.FCLOSE(vOutFileJ);
+UTL_FILE.FCLOSE(vOutFileR);
+
+END creaWAV2;
+
+-- --------------------------------------------------------------------------------------------------
+-- PROCEDURA PER LA PRODUZIONE DEL FILE DEGLI ALLARMI DA TRASFERIRE SU OPERA
+-- --------------------------------------------------------------------------------------------------
+-- ALLARMI STORICI
+PROCEDURE creaNautilus (vData date)
+AS
+
+vDataMin  VARCHAR2(17);
+vDataMinD Date;
+vDataMax  VARCHAR2(17);
+vDataMaxD Date;
+vDataExp  VARCHAR2(8);
+vOutFile  UTL_FILE.FILE_TYPE;
+
+v_rows_processed integer := 0;
+
+vInsertDate Date := sysdate ;
+
+CURSOR rec_name IS
+    SELECT * FROM alarm WHERE DELETEDAT between vDataMinD and vDataMaxD ORDER by DELETEDAT asc;
+
+    rec_val  rec_name%ROWTYPE;
+
+BEGIN
+vFunc := 'creaNautilus';
+id_file := opentrace(vDir, vFile);
+
+vStart := sysdate ;
+
+if (vData is null) then
+        vDataMin  := to_char((sysdate-1),'YYYYMMDD')||' 00:00:00';
+        vDataMax  := to_char((sysdate-1),'YYYYMMDD')||' 23:59:59';
+        vDataExp  := to_char(sysdate, 'YYYYMMDD');
+    else
+        vDataMin  := to_char(vData,'YYYYMMDD')||' 00:00:00';
+        vDataMax  := to_char(vData,'YYYYMMDD')||' 23:59:59';
+        vDataExp  := to_char(vData,'YYYYMMDD');
+end if;
+
+--dballutil.filTrace(id_file,vFunc,vLogInfo,'Creazione output file NAU_ABAM_' || vDataExp || '.csv');
+vOutFile := UTL_FILE.FOPEN('NAUTILUS_DATA', 'NAU_ABAM_' || vDataExp || '.csv', 'W', 32767);
+
+vDataMinD := to_date(vDataMin,'YYYYMMDD hh24:mi:ss');
+vDataMaxD := to_date(vDataMax,'YYYYMMDD hh24:mi:ss');
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'INIZIO creaNautilus su ALARM ' || vDataMin || ' - ' || vDataMax);
+
+vRecIns := 0;
+vCounter := 0;
+cCommitPoint := 10000;
+
+-- Inizio il loop sulla tabella
+OPEN rec_name;
+LOOP
+    FETCH rec_name INTO rec_val;
+    EXIT WHEN rec_name%NOTFOUND;
+
+    BEGIN
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ID), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.SOURCE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ALARMID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALALARMID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.SEVERITY), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ORIGINALSEVERITY), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.PROBABLECAUSE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.SUMMARY, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ALARMCOUNT), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ALARMTYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ALARMGROUP, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CATEGORY), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CLASS), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.AGENT, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MANAGER, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.EM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.IPEM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.FIRSTOCCURRENCE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.LASTOCCURRENCE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NESTARTALARM, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NELASTALARM, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ACKNOWLEDGED), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ACKTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CLOSETIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.COMPETENCEOB, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.COMPETENCEFOB, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MGMTCENTER, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCDESCR, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCNAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCGROUP, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NETWORK, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.SUBNETWORK, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALNEID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NEID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NEADDRESS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NETYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALNETYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MANUFACTURER, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALRESOURCENAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.RESOURCENAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.RESOURCETYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALRESOURCETYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CARDNAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CARDTYPEID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CARDTYPEDESCR, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALCARDNAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.PORTNAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALPORTNAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.PORTTYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.RESOURCESTATUS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LINKNAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LINKID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LINKTYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LINKSTATUS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCDESCRA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCNAMEA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCIDA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCGROUPA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCDESCRZ, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCNAMEZ, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCIDZ, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LOCGROUPZ, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.LINKACTIVATIONTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.SERVICEID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CLIENTNAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.SERVICENAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.PARENTIDS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ISCORRELATED), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TTIDENTIFIER, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TTPARENTID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TTREQUESTSTATUS), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TTREQUESTTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TTOWNERID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_STATOMTAMASS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TIPODEVICEMASS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TIPOCOSTITUZIONE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_PAYLOADTYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_FLAGDIVERSIFICAZIONE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_FLAGPROTEZIONE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_NUMGRUPPIINSTRADATI), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_STRATORETE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_STATOAFFIDABILITA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TIPOTERMINAZ, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TIPOUTILGRUPPO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CODICEANELLO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_DESCRCATEGORIA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_PRESENZALOP), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_ISALARMORIGINE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_ISTOPOCORRELATED), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_PROGRGRUPPO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_NODEPROGR, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_RETECLIENTEGRUPPO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_MULTICAST), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VPNNUM), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VRFNAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_SUPPORTEDPVCS), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_TIPOMSG, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_GRUPPO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_MGMTSTATUS), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_COMPETENZA), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_COMPETENZAINTERNA), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_STATOTX), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_STATOBB), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BBTX_ARCORRELATI), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_CONOSCENZA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.PARK), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.OUTAGE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NMS), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CORRELATIONTRIGGER), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TXCX_DELTA), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_SPECIFICPROBLEMS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_STATE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_NWSYNONYM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TO_ROS), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_SUBNOC, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_NOMELP, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CUSTOME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM1), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM2), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM3), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM9), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CUSTOMA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CUSTOMB, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CLASSE_TP, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_RUOLO_TP, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TELAIOEM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TELAIONM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_MODULOEM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_MODULONM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_COMPLESSOEM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_COMPLESSONM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_PERSISTENCETIMEOB), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_PERSISTENCETIMEFOB), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FREQUENCYTIME), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FREQUENCYCOUNT), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_DATACOS_ROS, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_DATACOS, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_DATAROS, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_ADDITIONALINFO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_MANAGEMENTSTATE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_AWARDEEROLE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT1), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT2), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT3), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT4), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT5), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT6), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT7), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.BB_VARINT8), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING1, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING2, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING3, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING4, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING5, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING6, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING7, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_VARSTRING8, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_ACRONIMOOPM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_ADDITIONALINFO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_ALARMQUALIFIERLIST, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_AUTONBATTERIE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DATETIMENTTCREATION, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_DEGRADO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DEGRTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_EMALIAS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_EMFILTERTYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_FREQUENCY_MSEM), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_IDOPM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_INTEXT, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_MAINTENANCESTATUSCURRENT, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_MESSAGE_TYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_NELASTMOD, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_NTTID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_NUMMSEM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NE_FUORISERVIZIO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_PORTELINK, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_PRGRUPPOEI, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_PROBABLECAUSE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_STATO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_TIPOSEGNMSEM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_TOTALEPORTEDISSERVITE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_NUMUTENTIDISS), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ACTION_STATUS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ACTION_MESSAGE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.INTALARMID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_SALA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_FILA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_TELAIOLIDO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_MODULOLIDO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_ALERTGROUP, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_COMPLESSOLIDO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.LAST_UPDATE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ACKUSERID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.PARKEXPIRETIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CORRELATIONROLE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NUMFIGLI), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_NOTE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TXCX_RELATION, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ALARM_USERID_LOCK, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CLIENTE_SPV, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_SPD, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_RELATEDALARM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.BB_RELATEDALARM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_MANAGEDBY, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_CUSTOM10), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_ADDITIONALTEXT, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_SPECIFICPROBLEM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NMS_STATOATTESASETTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_STATOATTESA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.NUMERO_JOURNAL), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.RECOVERY_STATUS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.RECOVERY_FLOW, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_DEST, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_ACKUSERID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DELETEACK), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_IDV5, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_L3ADDRESS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_CORR1, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.RECOVERY_WF_ID), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_ORIGINAL_FDN, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.RECOVERY_TYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.RECOVERY_EXITCODE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.LAST_JOURNAL_MESSAGE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.NMS_SITESHARING, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.INSERT_DATE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.FIRSTSEVERITY), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.DELETEDAT, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.HISTORIZE_STATE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ALARMTYPEID), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CAMPIHCW, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CHIAVESM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_CLIENTETOP2HCW, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CORRINTRA), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FORWARD2CX), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FORWARD2HCW), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_FORWARD2TISA), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_IDCORRINTRAPDH, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_IDINNESCO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_IDPADRECORR, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_NUMEROFIGLI), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_STATOESERCIZIOSCHEDA), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_MASSEXTCORRELATO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TX_ISABILITANTE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ISROOTCAUSE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ROOTCAUSEID, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.IMPACTANALISYS), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CORRSTR1, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TOOPERATIONVIEW), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.GAA_STATUS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_SLOGAN, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_ID_DC, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_SUPERCRITICAL, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_SA_FDN, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ORIGINALPARENTIDS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.PRIORITY, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.STRATEGICITA, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.STD_PROBABLECAUSE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_EOC, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.DATASCOR_R2010_EXT, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_SUBINTERFACE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_LINE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_SLOT, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.CX_PASSOTLI, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DATETIMEOSBEGIN, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_DATETIMEOSEND, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.STD_PROBABLECAUSE_NO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TX_NETWORKALARM, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TIPOINDOTTO), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.RESOURCENAMETOVIEW, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_CAT_SITO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MODELLO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.CX_ROUTINGTIME, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.LASTSEVERITY), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.MANUAL_CLOSE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.MOB_KEY_TYPE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.ORIGINE_GUASTO), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.MOB_ACCESSIB_SITO), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.FLAG_DISP_ON_FIELD), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.WRIDENTIFIER, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.WRSTATUS, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.MOB_CELLNAME, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.WRTYPE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.TTPRIORITY, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TTCORRELATIONSTATE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.TIPO_NTT), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.FLAG_STD_PROBABLECAUSE), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.DATAPRESENTAZIONE, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.STATO_IMPIANTO, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(TO_CHAR(rec_val.DATA_STATO, 'YYYY-MM-DD HH24:MI:SS'), chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.ADMINISTRATIVE_STATE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.OPERATIONAL_STATE, chr(10), '') || chr(31));
+        UTL_FILE.PUT(vOutFile, replace(rec_val.FLAG_PS, chr(10), ''));
+
+        UTL_FILE.NEW_LINE(vOutFile);
+        UTL_FILE.FFLUSH(vOutFile);
+    END;
+
+    vRecIns := vRecIns + 1;
+    vCounter := vCounter + 1;
+
+    IF vCounter = cCommitPoint then
+        dballutil.filTrace(id_file,vFunc,vLogInfo,'Estratti '|| vRecIns || ' records');
+        vCounter := 0;
+    END IF;
+END LOOP;
+
+CLOSE rec_name;
+
+--dballutil.filTrace(id_file,vFunc,vLogInfo,'Estratti '|| vRecIns || ' records');
+dballutil.filTrace(id_file,vFunc,vLogInfo,'FINE   creaNautilus su ALARM. Estratti '|| vRecIns || ' records');
+
+UTL_FILE.FCLOSE(vOutFile);
+
+vOutFile := UTL_FILE.FOPEN('NAUTILUS_DATA', 'NAU_ABAM_' || vDataExp || '.OK', 'W', 32767);
+
+UTL_FILE.PUT_LINE(vOutFile,vRecIns);
+UTL_FILE.FFLUSH(vOutFile);
+
+UTL_FILE.FCLOSE(vOutFile);
+
+END creaNautilus;
+
+-- --------------------------------------------------------------------------------------------------
+-- PROCEDURA PER IL TRASFERIMENTO DEGLI ALLARMI SU NAUTILUS
+-- --------------------------------------------------------------------------------------------------
+-- ALLARMI STORICI
+/*
+PROCEDURE insNautilus (vData1 date, vData2 date)
+AS
+
+vDataMin VARCHAR2(17);
+vDataMinD Date;
+vDataMax VARCHAR2(17);
+vDataMaxD Date;
+
+v_rows_processed integer := 0;
+
+vInsertDate Date := sysdate ;
+
+CURSOR rec_name is
+    SELECT
+        ID,
+        SOURCE,
+        ALARMID,
+        ORIGINALALARMID,
+        SEVERITY,
+        ORIGINALSEVERITY,
+        PROBABLECAUSE,
+        SUMMARY,
+        ALARMCOUNT,
+        ALARMTYPE,
+        ALARMGROUP,
+        CATEGORY,
+        CLASS,
+        AGENT,
+        MANAGER,
+        EM,
+        IPEM,
+        FIRSTOCCURRENCE,
+        LASTOCCURRENCE,
+        NESTARTALARM,
+        NELASTALARM,
+        ACKNOWLEDGED,
+        ACKTIME,
+        CLOSETIME,
+        COMPETENCEOB,
+        COMPETENCEFOB,
+        MGMTCENTER,
+        LOCDESCR,
+        LOCNAME,
+        LOCID,
+        LOCGROUP,
+        NETWORK,
+        SUBNETWORK,
+        ORIGINALNEID,
+        NEID,
+        NEADDRESS,
+        NETYPE,
+        ORIGINALNETYPE,
+        MANUFACTURER,
+        ORIGINALRESOURCENAME,
+        RESOURCENAME,
+        RESOURCETYPE,
+        ORIGINALRESOURCETYPE,
+        CARDNAME,
+        CARDTYPEID,
+        CARDTYPEDESCR,
+        ORIGINALCARDNAME,
+        PORTNAME,
+        ORIGINALPORTNAME,
+        PORTTYPE,
+        RESOURCESTATUS,
+        LINKNAME,
+        LINKID,
+        LINKTYPE,
+        LINKSTATUS,
+        LOCDESCRA,
+        LOCNAMEA,
+        LOCIDA,
+        LOCGROUPA,
+        LOCDESCRZ,
+        LOCNAMEZ,
+        LOCIDZ,
+        LOCGROUPZ,
+        LINKACTIVATIONTIME,
+        SERVICEID,
+        CLIENTNAME,
+        SERVICENAME,
+        PARENTIDS,
+        ISCORRELATED,
+        TTIDENTIFIER,
+        TTPARENTID,
+        TTREQUESTSTATUS,
+        TTREQUESTTIME,
+        TTOWNERID,
+        TX_STATOMTAMASS,
+        TX_TIPODEVICEMASS,
+        TX_TIPOCOSTITUZIONE,
+        TX_PAYLOADTYPE,
+        TX_FLAGDIVERSIFICAZIONE,
+        TX_FLAGPROTEZIONE,
+        TX_NUMGRUPPIINSTRADATI,
+        TX_STRATORETE,
+        TX_STATOAFFIDABILITA,
+        TX_TIPOTERMINAZ,
+        TX_TIPOUTILGRUPPO,
+        TX_CODICEANELLO,
+        TX_DESCRCATEGORIA,
+        TX_PRESENZALOP,
+        TX_ISALARMORIGINE,
+        TX_ISTOPOCORRELATED,
+        TX_PROGRGRUPPO,
+        TX_NODEPROGR,
+        TX_RETECLIENTEGRUPPO,
+        BB_MULTICAST,
+        BB_VPNNUM,
+        BB_VRFNAME,
+        BB_SUPPORTEDPVCS,
+        BB_TIPOMSG,
+        BB_GRUPPO,
+        BB_MGMTSTATUS,
+        BBTX_COMPETENZA,
+        BBTX_COMPETENZAINTERNA,
+        BBTX_STATOTX,
+        BBTX_STATOBB,
+        BBTX_ARCORRELATI,
+        CX_CONOSCENZA,
+        PARK,
+        OUTAGE,
+        BB,
+        TX,
+        CX,
+        NMS,
+        CORRELATIONTRIGGER,
+        TXCX_DELTA,
+        NMS_SPECIFICPROBLEMS,
+        NMS_STATE,
+        NMS_NWSYNONYM,
+        TO_ROS,
+        TX_SUBNOC,
+        TX_NOMELP,
+        TX_CUSTOME,
+        TX_CUSTOM1,
+        TX_CUSTOM2,
+        TX_CUSTOM3,
+        TX_CUSTOM9,
+        TX_CUSTOMA,
+        TX_CUSTOMB,
+        TX_CLASSE_TP,
+        TX_RUOLO_TP,
+        TX_TELAIOEM,
+        TX_TELAIONM,
+        TX_MODULOEM,
+        TX_MODULONM,
+        TX_COMPLESSOEM,
+        TX_COMPLESSONM,
+        TX_PERSISTENCETIMEOB,
+        TX_PERSISTENCETIMEFOB,
+        TX_FREQUENCYTIME,
+        TX_FREQUENCYCOUNT,
+        TX_DATACOS_ROS,
+        TX_DATACOS,
+        TX_DATAROS,
+        NMS_ADDITIONALINFO,
+        NMS_MANAGEMENTSTATE,
+        NMS_AWARDEEROLE,
+        BB_VARINT1,
+        BB_VARINT2,
+        BB_VARINT3,
+        BB_VARINT4,
+        BB_VARINT5,
+        BB_VARINT6,
+        BB_VARINT7,
+        BB_VARINT8,
+        BB_VARSTRING1,
+        BB_VARSTRING2,
+        BB_VARSTRING3,
+        BB_VARSTRING4,
+        BB_VARSTRING5,
+        BB_VARSTRING6,
+        BB_VARSTRING7,
+        BB_VARSTRING8,
+        CX_ACRONIMOOPM,
+        CX_ADDITIONALINFO,
+        CX_ALARMQUALIFIERLIST,
+        CX_AUTONBATTERIE,
+        CX_DATETIMENTTCREATION,
+        CX_DEGRADO,
+        CX_DEGRTIME,
+        CX_EMALIAS,
+        CX_EMFILTERTYPE,
+        CX_FREQUENCY_MSEM,
+        CX_IDOPM,
+        CX_INTEXT,
+        CX_MAINTENANCESTATUSCURRENT,
+        CX_MESSAGE_TYPE,
+        CX_NELASTMOD,
+        CX_NTTID,
+        CX_NUMMSEM,
+        NE_FUORISERVIZIO,
+        CX_PORTELINK,
+        CX_PRGRUPPOEI,
+        CX_PROBABLECAUSE,
+        CX_STATO,
+        CX_TIPOSEGNMSEM,
+        CX_TOTALEPORTEDISSERVITE,
+        CX_NUMUTENTIDISS,
+        ACTION_STATUS,
+        ACTION_MESSAGE,
+        INTALARMID,
+        TX_SALA,
+        TX_FILA,
+        TX_TELAIOLIDO,
+        TX_MODULOLIDO,
+        TX_ALERTGROUP,
+        TX_COMPLESSOLIDO,
+        LAST_UPDATE,
+        ACKUSERID,
+        PARKEXPIRETIME,
+        CORRELATIONROLE,
+        NUMFIGLI,
+        CX_NOTE,
+        TXCX_RELATION,
+        ALARM_USERID_LOCK,
+        TX_CLIENTE_SPV,
+        CX_SPD,
+        CX_RELATEDALARM,
+        BB_RELATEDALARM,
+        NMS_MANAGEDBY,
+        TX_CUSTOM10,
+        NMS_ADDITIONALTEXT,
+        NMS_SPECIFICPROBLEM,
+        NMS_STATOATTESASETTIME,
+        NMS_STATOATTESA,
+        NUMERO_JOURNAL,
+        RECOVERY_STATUS,
+        RECOVERY_FLOW,
+        NMS_DEST,
+        NMS_ACKUSERID,
+        CX_DELETEACK,
+        CX_IDV5,
+        CX_L3ADDRESS,
+        NMS_CORR1,
+        RECOVERY_WF_ID,
+        NMS_ORIGINAL_FDN,
+        RECOVERY_TYPE,
+        RECOVERY_EXITCODE,
+        LAST_JOURNAL_MESSAGE,
+        NMS_SITESHARING,
+        INSERT_DATE,
+        FIRSTSEVERITY,
+        DELETEDAT,
+        HISTORIZE_STATE,
+        ALARMTYPEID,
+        TX_CAMPIHCW,
+        TX_CHIAVESM,
+        TX_CLIENTETOP2HCW,
+        CORRINTRA,
+        TX_FORWARD2CX,
+        TX_FORWARD2HCW,
+        TX_FORWARD2TISA,
+        TX_IDCORRINTRAPDH,
+        TX_IDINNESCO,
+        TX_IDPADRECORR,
+        TX_NUMEROFIGLI,
+        TX_STATOESERCIZIOSCHEDA,
+        TX_MASSEXTCORRELATO,
+        TX_ISABILITANTE,
+        ISROOTCAUSE,
+        ROOTCAUSEID,
+        IMPACTANALISYS,
+        CORRSTR1,
+        TOOPERATIONVIEW,
+        GAA_STATUS,
+        MOB_SLOGAN,
+        MOB_ID_DC,
+        MOB_SUPERCRITICAL,
+        MOB_SA_FDN,
+        ORIGINALPARENTIDS,
+        PRIORITY,
+        STRATEGICITA,
+        STD_PROBABLECAUSE,
+        CX_EOC,
+        DATASCOR_R2010_EXT,
+        CX_SUBINTERFACE,
+        CX_LINE,
+        CX_SLOT,
+        CX_PASSOTLI,
+        CX_DATETIMEOSBEGIN,
+        CX_DATETIMEOSEND,
+        STD_PROBABLECAUSE_NO,
+        TX_NETWORKALARM,
+        TIPOINDOTTO,
+        RESOURCENAMETOVIEW,
+        MOB_CAT_SITO,
+        MODELLO,
+        CX_ROUTINGTIME,
+        vInsertDate,
+        LASTSEVERITY,
+        MANUAL_CLOSE,
+        MOB_KEY_TYPE,
+        ORIGINE_GUASTO,
+        FLAG_DISP_ON_FIELD,
+        WRIDENTIFIER,
+        WRSTATUS
+    FROM alarm WHERE
+    DELETEDAT between vDataMinD and vDataMaxD
+    ORDER by DELETEDAT asc;
+
+rec_val  rec_name%ROWTYPE;
+
+BEGIN
+
+vFunc := 'insNautilus';
+id_file := opentrace(vDir, vFile);
+
+vStart := sysdate ;
+
+if (vData1 is null) then
+       vDataMin  := to_char((sysdate-1),'YYYYMMDD')||' 00:00:00';
+       vDataMax  := to_char((sysdate-1),'YYYYMMDD')||' 23:59:59';
+    else
+       vDataMin  := to_char(vData1,'YYYYMMDD')||' 00:00:00';
+       vDataMax  := to_char(vData2,'YYYYMMDD')||' 23:59:59';
+end if;
+
+       vDataMinD := to_date(vDataMin,'YYYYMMDD hh24:mi:ss');
+       vDataMaxD := to_date(vDataMax,'YYYYMMDD hh24:mi:ss');
+
+
+dballutil.filTrace(id_file,vFunc,vLogInfo,'INIZIO insNautilus su ALARM '||vDataMin||' - '||vDataMax);
+
+   vRecIns  := 0;
+   vRecUpd  := 0;
+   vRecSki  := 0;
+   vCounter := 0;
+   cCommitPoint := 5000;
+
+-- Inizio il loop sulla tabella
+   FOR  rec_val in rec_name
+   LOOP
+      exit when rec_name%NOTFOUND;
+
+      BEGIN
+         INSERT INTO ALARM@nautilus values rec_val;
+
+                vRecIns := vRecIns + 1;
+      EXCEPTION
+         WHEN user_canc THEN
+               my_code := SQLCODE;
+               my_errm := SQLERRM;
+               dballutil.filTrace(id_file,vFunc,vLogErr,'Error code ' || my_code || ': ' || my_errm);
+               dballutil.filTrace(id_file,vFunc,vLogInfo,'Commit Point Reached! INS: '||vRecIns||' UPD: '||vRecUpd||' SKIP: '||vRecSki||' - '||to_char(rec_val.deletedat,'dd/mm/yyyy hh24:mi'));
+         WHEN record_exist THEN
+               --dballutil.filTrace(id_file,vFunc,vLogInfo,rec_val.ID||' - Record esistente - continuo - '||rec_val.DELETEDAT);
+               vRecSki := vRecSki + 1;
+         WHEN OTHERS THEN
+               my_code := SQLCODE;
+               my_errm := SQLERRM;
+               dballutil.filTrace(id_file,vFunc,vLogErr,'Error code ' || my_code || ': ' || my_errm);
+         return;
+
+      END;
+
+         vCounter := vCounter + 1;
+
+         if vCounter = cCommitPoint then
+            dballutil.filTrace(id_file,vFunc,vLogInfo,'Commit Point Reached! INS: '||vRecIns||' UPD: '||vRecUpd||' SKIP: '||vRecSki||' - '||to_char(rec_val.deletedat,'dd/mm/yyyy hh24:mi'));
+            COMMIT;
+            vCounter := 0;
+         end if;
+   END LOOP;
+COMMIT;
+
+vEnd := sysdate;
+vRecDel := vRecIns + vRecUpd + vRecSki;
+
+--vElapsed := date_to_num(to_char(vEnd,'yyyymmddhh24miss'))-date_to_num(to_char(vStart,'yyyymmddhh24miss'));
+--vElapsedH := round((vElapsed/3600));
+--vElapsedM := round((vElapsed/60)-(vElapsedH*60));
+--vElapsedS := vElapsed-(vElapsedH*60*60)-(vElapsedM*60);
+--dballutil.filTrace(id_file,vFunc,vLogInfo,'Elapsed: '||vElapsed||' sec - '||vElapsedH||'.'||vElapsedM||'.'||vElapsedS);
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Elapsed: '||vElapsed||' sec - hh.mm.ss: '||dballutil.write_elapsed(vStart, vEnd));
+dballutil.filTrace(id_file,vFunc,vLogInfo,'Records inseriti: '||vRecIns||' modificati: '||vRecUpd||' skippati: '||vRecSki||' Tot: '||vRecDel);
+dballutil.filTrace(id_file,vFunc,vLogInfo,'FINE   insNautilus. Records inseriti: ' || vRecIns || ' skippati: ' || vRecSki || ' Tot: ' || vRecDel);
+utl_file.fclose(id_file);
+
+EXCEPTION
+   WHEN user_canc THEN
+         my_code := SQLCODE;
+         my_errm := SQLERRM;
+         dballutil.filTrace(id_file,vFunc,vLogErr,'Error code ' || my_code || ': ' || my_errm);
+         dballutil.filTrace(id_file,vFunc,vLogInfo,'Commit Point Reached! INS: '||vRecIns||' UPD: '||vRecUpd||' SKIP: '||vRecSki||' - '||to_char(rec_val.deletedat,'dd/mm/yyyy hh24:mi'));
+   WHEN record_exist THEN
+         dballutil.filTrace(id_file,vFunc,vLogInfo,'Record esistente - continuo');
+   WHEN OTHERS THEN
+
+   my_code := SQLCODE;
+   my_errm := SQLERRM;
+
+   dballutil.filTrace(id_file,vFunc,vLogErr,'Error code ' || my_code || ': ' || my_errm);
+   return;
+
+END insNautilus;
+*/
+
+
+-- ALLARMI ATTIVI
+
+END dballutil;
