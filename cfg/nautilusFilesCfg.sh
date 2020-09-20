@@ -17,6 +17,9 @@ export DATA_FN_PRFX="alarms-"
 export DATA_FN_SFFX=".csv"
 export DATA_FILE_CHECK="$DATA_DIR/$DATA_FN_PRFX*$DATA_FN_SFFX"
 
+export RES_FN_PRFX="NAU_ABAM_"
+export RES_FN_SFFX=".csv"
+
 export OK_FILE="$BASE_FILE_NAME.OK"
 export CONV_FILE="$BASE_FILE_NAME.conv"
 export TAR_FILE="$BASE_FILE_NAME.tar"

@@ -3,12 +3,18 @@
 . ./cfg/nautilusFilesCfg.sh
 . $SCRIPTS_DIR/nautilusFilesUtils.sh
 
+if [ "$#" -ne 1 ]; then
+
+    log_error "Passare il nome del file da inviare alla chiamata."
+    exit 1;
+fi
+
 fileName=$1
 
 if [[ ! -e $fileName ]]
 then
 
-  log_error "File da inoltrare >$filename< non trovato."
+  log_error "File da inoltrare >$fileName< non trovato."
   exit 1
 fi
 
@@ -31,35 +37,42 @@ do
     if [[ $SFTP_METHOD = "scp" ]]
     then
 
-      scp -o StrictHostKeyChecking=no -qp $fileName $SFTP_USER@$SFTP_HOST:$SFTP_PATH/$GZ_FILE
+      echo scp -o StrictHostKeyChecking=no \
+        -qp $fileName $SFTP_USER@$SFTP_HOST:$SFTP_PATH/$GZ_FILE
+
+      scp -o StrictHostKeyChecking=no \
+        -qp $fileName $SFTP_USER@$SFTP_HOST:$SFTP_PATH/$GZ_FILE
 
       if [[ $? -eq 0 ]]
       then
 
-      log_info "Trasferimento completato con successo"
+        log_info "Trasferimento completato con successo"
+
+      else
+
+        log_info "Trasferimento non completato"
+      fi
 
     else
 
-      log_info "Trasferimento non completato"
-    fi
+      log_info "Creazione sftp batch script"
+      echo "cd $SFTP_PATH" > $LOG_DIR/$SFTP_SCRIPT
+      echo "put $fileName" >> $LOG_DIR/$SFTP_SCRIPT
+      echo "bye" >> $LOG_DIR/$SFTP_SCRIPT
 
-  else
+      sftp -o StrictHostKeyChecking=no \
+        -b $LOG_DIR/$SFTP_SCRIPT $SFTP_USER@$SFTP_HOST
 
-    log_info "Creazione sftp batch script"
-    echo "cd $SFTP_PATH" > $LOG_DIR/$SFTP_SCRIPT
-    echo "put $fileName" >> $LOG_DIR/$SFTP_SCRIPT
-    echo "bye" >> $LOG_DIR/$SFTP_SCRIPT
+      rm -f $LOG_DIR/$SFTP_SCRIPT
 
-    sftp -o StrictHostKeyChecking=no -b $LOG_DIR/$SFTP_SCRIPT $SFTP_USER@$SFTP_HOST
+      if [[ $? -eq 0 ]]
+      then
 
-    rm -f $LOG_DIR/$SFTP_SCRIPT
+        log_info "Trasferimento completato con successo"
+      else
 
-    if [[ $? -eq 0 ]]
-    then
-
-      log_info "Trasferimento completato con successo"
-    else
-      log_error "Errore nel trasferimento"
+        log_error "Errore nel trasferimento"
+      fi
     fi
   fi
 
