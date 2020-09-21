@@ -18,6 +18,8 @@ then
   exit 1
 fi
 
+destFileName=`basename $fileName`
+
 
 while read LINE
 do
@@ -32,16 +34,16 @@ do
   if [[ $SFTP_ENABLED -eq 1 ]]
   then
 
-    log_info "Inizio trasferimento file $GZ_FILE su $SFTP_HOST per $SFTP_DEST"
+    log_info "Inizio trasferimento file $fileName su $SFTP_HOST per $SFTP_DEST"
 
     if [[ $SFTP_METHOD = "scp" ]]
     then
 
       echo scp -o StrictHostKeyChecking=no \
-        -qp $fileName $SFTP_USER@$SFTP_HOST:$SFTP_PATH/$GZ_FILE
+        -qp $fileName $SFTP_USER@$SFTP_HOST:$SFTP_PATH/$destFileName
 
       scp -o StrictHostKeyChecking=no \
-        -qp $fileName $SFTP_USER@$SFTP_HOST:$SFTP_PATH/$GZ_FILE
+        -qp $fileName $SFTP_USER@$SFTP_HOST:$SFTP_PATH/$destFileName
 
       if [[ $? -eq 0 ]]
       then
@@ -63,8 +65,6 @@ do
       sftp -o StrictHostKeyChecking=no \
         -b $LOG_DIR/$SFTP_SCRIPT $SFTP_USER@$SFTP_HOST
 
-      rm -f $LOG_DIR/$SFTP_SCRIPT
-
       if [[ $? -eq 0 ]]
       then
 
@@ -73,9 +73,11 @@ do
 
         log_error "Errore nel trasferimento"
       fi
+
+      rm -f $LOG_DIR/$SFTP_SCRIPT
     fi
   fi
 
-done < $CFG_DIR/$HOSTS_FILE
+done < $HOSTS_FILE
 
 exit 0

@@ -1,4 +1,5 @@
-TEST|niamitf01|wav|/tmp|sftp|0
-TEST|niamitf01|wav|/tmp|scp|1
+TEST|niamitf01|wav|/tmp|sftp|1
+TEST|niamitf01|wav|/tmp|scp|0
+TEST|niamitf01|sftpUser|/tmp|scp|0
 OPERA|OpeRAESDB|abam|/data/opera/source/abam|sftp|0
 FER|feu-name-node-3|hadoop|/data/d1/alarmstaging|scp|0

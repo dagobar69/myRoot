@@ -26,7 +26,7 @@ export TAR_FILE="$BASE_FILE_NAME.tar"
 export GZ_FILE="$BASE_FILE_NAME.tar.gz"
 export LOG_FILE="$LOG_DIR/$UTILITY_NAME.log"
 
-export HOSTS_FILE=$CFG_DIR/HostsList.def
+export HOSTS_FILE=$CFG_DIR/HostList.def
 export SFTP_SCRIPT=$UTILITY_NAME.ftp
 
 export DATA_FILE_EXT=.txt
@@ -34,6 +34,3 @@ export PRCSD_FILE_EXT=.prcsd
 
 
 export RETENTION=5
-
-export HOSTS_FILE=HostsList.def
-export SFTP_SCRIPT=CreaFileOpera.ftp
